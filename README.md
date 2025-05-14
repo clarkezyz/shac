@@ -213,7 +213,9 @@ codec.add_mono_source("voice", voice_audio, attributes.position, attributes)
 
 ### Real-time Processing
 
-For interactive applications, you can process audio in real-time:
+For interactive applications, you can process audio in real-time. SHAC offers several streaming options depending on your needs:
+
+### Basic Real-time Processing
 
 ```python
 def audio_callback(output_frame):
@@ -229,6 +231,54 @@ codec.update_listener_orientation(yaw, pitch, roll)
 
 # Stop when done
 codec.stop_realtime_processing()
+```
+
+### Optimized Real-time Processing
+
+For performance-critical applications, use the optimized streaming components:
+
+```python
+from shac.codec.streaming_optimized import SHACStreamProcessor
+
+# Create an optimized stream processor
+processor = SHACStreamProcessor(order=3, sample_rate=48000, buffer_size=1024)
+
+# Add audio sources
+processor.add_source("piano", (0.0, 0.0, 2.0))
+processor.update_source("piano", piano_audio)
+
+# Start processing
+processor.start()
+
+# In your audio callback
+binaural_output = processor.get_binaural_output()
+
+# When done
+processor.stop()
+```
+
+### Adaptive Buffer Management
+
+For systems with varying performance capabilities:
+
+```python
+from shac.codec.adaptive_streaming import AdaptiveSHACStreamProcessor
+
+# Create an adaptive processor that adjusts to system capabilities
+processor = AdaptiveSHACStreamProcessor(
+    order=3, 
+    sample_rate=48000,
+    initial_buffer_size=1024,
+    enable_adaptation=True
+)
+
+# The processor will automatically adjust buffer size based on CPU load
+```
+
+Try the optimized streaming demo to see these features in action:
+
+```bash
+python optimized_streaming_demo.py
 ```
 
 ## Project Structure

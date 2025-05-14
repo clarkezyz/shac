@@ -51,3 +51,4 @@ output/*.shac
 
 # Jupyter Notebook
 .ipynb_checkpoints
+**/.claude/settings.local.json

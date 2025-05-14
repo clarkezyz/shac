@@ -91,10 +91,11 @@ shac/
    - Format conversion utilities
    - Import/export capabilities
 
-8. **Streaming (`streaming.py`)**:
-   - Real-time processing framework
-   - Buffer management
-   - Asynchronous processing
+8. **Streaming System**:
+   - `streaming.py`: Basic real-time processing framework
+   - `streaming_optimized.py`: Enhanced streaming with buffer pooling 
+   - `vector_ops.py`: Vectorized audio operations with SIMD acceleration
+   - `adaptive_streaming.py`: Automatic buffer size adaptation for optimal performance
 
 ## Key Features
 
@@ -230,7 +231,11 @@ When working on this project, keep the following in mind:
 
 2. **Backward Compatibility**: Maintain compatibility with existing demos and applications when making changes.
 
-3. **Performance Considerations**: Spatial audio processing can be computationally intensive. Consider performance implications of changes, especially for real-time applications.
+3. **Performance Considerations**: Spatial audio processing can be computationally intensive. Use the optimized streaming components for real-time applications:
+   - Buffer pooling (`streaming_optimized.py`) for memory efficiency
+   - Vectorized operations (`vector_ops.py`) for processing speed
+   - Adaptive buffer sizing (`adaptive_streaming.py`) for hardware adaptation
+   - The `optimized_streaming_demo.py` script demonstrates these optimizations
 
 4. **Documentation**: Keep this document and other documentation up-to-date as you make changes to the project.
 
