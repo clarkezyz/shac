@@ -1,0 +1,1488 @@
+"""
+SHAC Core - Spherical Harmonic Audio Codec Core Implementation
+
+This module contains the core implementation of the SHAC spatial audio codec.
+It provides essential functions for spherical harmonic processing, encoding, 
+rotation, and binauralization, separated from documentation and example code.
+
+Author: Claude
+License: MIT License
+"""
+
+import numpy as np
+import math
+from enum import Enum
+from typing import Dict, List, Tuple, Optional, Union
+
+# =====================================================================================
+# Constants and Type Definitions
+# =====================================================================================
+
+class AmbisonicNormalization(Enum):
+    """Defines the normalization convention for spherical harmonics"""
+    SN3D = 1  # Schmidt semi-normalized (most common, N3D / sqrt(2n+1))
+    N3D = 2   # Fully normalized (orthonormal basis)
+    FUMA = 3  # FuMa (legacy B-format) normalization
+
+
+class AmbisonicOrdering(Enum):
+    """Defines the channel ordering convention for ambisonics"""
+    ACN = 1    # Ambisonic Channel Number (most common)
+    FUMA = 2   # FuMa (legacy B-format) ordering
+    CUSTOM = 3 # User-defined ordering
+
+
+# =====================================================================================
+# Core Mathematical Functions
+# =====================================================================================
+
+def factorial(n: int) -> int:
+    """Compute factorial, optimized for small integers"""
+    if n < 0:
+        raise ValueError("Factorial not defined for negative numbers")
+    if n <= 1:
+        return 1
+    
+    result = 1
+    for i in range(2, n + 1):
+        result *= i
+    return result
+
+
+def associated_legendre(l: int, m: int, x: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+    """
+    Compute the associated Legendre polynomial P_l^m(x) for spherical harmonics.
+    
+    This is a custom implementation optimized for spherical harmonics, avoiding
+    the phase issue in scipy's implementation and handling the normalization correctly.
+    
+    Args:
+        l: Degree of the spherical harmonic (l >= 0)
+        m: Order of the spherical harmonic (-l <= m <= l)
+        x: Value or array where -1 <= x <= 1
+        
+    Returns:
+        The associated Legendre polynomial value(s)
+    """
+    m_abs = abs(m)
+    
+    if m_abs > l:
+        return np.zeros_like(x) if isinstance(x, np.ndarray) else 0.0
+    
+    # Handle the case where l = m = 0 explicitly
+    if l == 0 and m == 0:
+        return np.ones_like(x) if isinstance(x, np.ndarray) else 1.0
+    
+    # First compute P_m^m
+    pmm = 1.0
+    somx2 = np.sqrt((1.0 - x) * (1.0 + x)) if isinstance(x, np.ndarray) else math.sqrt((1.0 - x) * (1.0 + x))
+    fact = 1.0
+    
+    for i in range(1, m_abs + 1):
+        pmm *= (-fact) * somx2
+        fact += 2.0
+    
+    if l == m_abs:
+        return pmm
+    
+    # Compute P_{m+1}^m
+    pmmp1 = x * (2.0 * m_abs + 1.0) * pmm
+    
+    if l == m_abs + 1:
+        return pmmp1
+    
+    # Use the recurrence relationship to get higher degrees
+    pll = 0.0
+    for ll in range(m_abs + 2, l + 1):
+        pll = (x * (2.0 * ll - 1.0) * pmmp1 - (ll + m_abs - 1.0) * pmm) / (ll - m_abs)
+        pmm = pmmp1
+        pmmp1 = pll
+    
+    # Apply Condon-Shortley phase for m < 0
+    if m < 0:
+        pll *= (-1)**m_abs * factorial(l - m_abs) / factorial(l + m_abs)
+    
+    return pll
+
+
+def real_spherical_harmonic(l: int, m: int, theta: float, phi: float, 
+                          normalization: AmbisonicNormalization = AmbisonicNormalization.SN3D) -> float:
+    """
+    Compute the real-valued spherical harmonic Y_l^m(theta, phi) for given degree l and order m.
+    
+    Args:
+        l: Degree of the spherical harmonic (l >= 0)
+        m: Order of the spherical harmonic (-l <= m <= l)
+        theta: Azimuthal angle in radians [0, 2π)
+        phi: Polar angle in radians [0, π]
+        normalization: Normalization convention to use
+        
+    Returns:
+        The value of the real spherical harmonic
+    """
+    # Ensure valid range for parameters
+    if l < 0:
+        raise ValueError("Degree l must be non-negative")
+    if abs(m) > l:
+        raise ValueError("Order m must satisfy -l <= m <= l")
+    
+    # Compute normalization factor
+    if normalization == AmbisonicNormalization.SN3D:
+        # Schmidt semi-normalized (SN3D)
+        if m == 0:
+            norm = math.sqrt((2 * l + 1) / (4 * math.pi))
+        else:
+            norm = math.sqrt((2 * l + 1) / (2 * math.pi) * factorial(l - abs(m)) / factorial(l + abs(m)))
+    elif normalization == AmbisonicNormalization.N3D:
+        # Fully normalized (N3D)
+        norm = math.sqrt((2 * l + 1) * factorial(l - abs(m)) / (4 * math.pi * factorial(l + abs(m))))
+    elif normalization == AmbisonicNormalization.FUMA:
+        # FuMa normalization (for legacy B-format)
+        if l == 0 and m == 0:
+            norm = 1.0 / math.sqrt(2)  # W channel scaling
+        elif l == 1:
+            norm = 1.0  # X, Y, Z channels
+        else:
+            # Higher order channels match SN3D but with empirical scaling
+            norm = math.sqrt((2 * l + 1) / (2 * math.pi) * factorial(l - abs(m)) / factorial(l + abs(m)))
+    else:
+        raise ValueError(f"Unsupported normalization: {normalization}")
+    
+    # Convert to Cartesian coordinates for associatedLegendre
+    x = math.cos(phi)
+    
+    # Compute the associated Legendre polynomial
+    plm = associated_legendre(l, abs(m), x)
+    
+    # Compute the spherical harmonic
+    if m == 0:
+        return norm * plm
+    elif m > 0:
+        return norm * math.sqrt(2) * plm * math.cos(m * theta)
+    else:  # m < 0
+        return norm * math.sqrt(2) * plm * math.sin(abs(m) * theta)
+
+
+def compute_rotation_matrix(order: int, yaw: float, pitch: float, roll: float) -> np.ndarray:
+    """
+    Compute a rotation matrix for spherical harmonic coefficients.
+    
+    Args:
+        order: Maximum degree of spherical harmonics
+        yaw: Rotation around vertical axis in radians
+        pitch: Rotation around side axis in radians
+        roll: Rotation around front axis in radians
+        
+    Returns:
+        Rotation matrix of shape ((order+1)², (order+1)²)
+    """
+    # Use factorized rotation for efficiency
+    # R = Rz(yaw) * Ry(pitch) * Rz(roll)
+    n_sh = (order + 1) ** 2
+    
+    # Compute rotation matrices for each axis
+    R_yaw = _compute_z_rotation_matrix(order, yaw)
+    R_pitch = _compute_y_rotation_matrix(order, pitch)
+    R_roll = _compute_z_rotation_matrix(order, roll)
+    
+    # Combine rotations
+    R = R_yaw @ R_pitch @ R_roll
+    
+    return R
+
+
+def _compute_z_rotation_matrix(order: int, angle: float) -> np.ndarray:
+    """Compute rotation matrix for rotation around Z-axis"""
+    n_sh = (order + 1) ** 2
+    R = np.eye(n_sh)
+    
+    # Z-rotation only affects same-degree coefficients with different orders
+    for l in range(1, order + 1):
+        # For each degree l, create a block rotation matrix
+        block_size = 2 * l + 1
+        block_start = l * l
+        
+        # Create block rotation matrix
+        block = np.zeros((block_size, block_size))
+        
+        # Fill block with sine and cosine terms
+        for m in range(-l, l + 1):
+            for n in range(-l, l + 1):
+                if m == n:
+                    block[m + l, n + l] = math.cos(m * angle)
+                elif m == -n:
+                    block[m + l, n + l] = math.sin(m * angle)
+        
+        # Insert block into rotation matrix
+        R[block_start:block_start + block_size, block_start:block_start + block_size] = block
+    
+    return R
+
+
+def _compute_y_rotation_matrix(order: int, angle: float) -> np.ndarray:
+    """Compute rotation matrix for rotation around Y-axis"""
+    n_sh = (order + 1) ** 2
+    R = np.eye(n_sh)
+    
+    # Pre-compute cosine and sine of angle
+    c = math.cos(angle)
+    s = math.sin(angle)
+    
+    # For each degree
+    for l in range(1, order + 1):
+        # For each order
+        for m in range(-l, l + 1):
+            # ACN index of (l, m)
+            acn_m = l * l + l + m
+            
+            # Apply small-angle rotation matrix (for demonstration)
+            # A complete implementation would use Wigner d-matrices
+            if abs(m) < l:
+                # Simplified for small angles
+                if m >= 0:
+                    # Mix with (l, m+1)
+                    acn_mp1 = l * l + l + (m + 1)
+                    if acn_mp1 < n_sh:
+                        R[acn_m, acn_mp1] = -s * math.sqrt((l - m) * (l + m + 1)) / 2
+                        R[acn_mp1, acn_m] = s * math.sqrt((l - m) * (l + m + 1)) / 2
+                
+                # Mix with (l, m-1)
+                acn_mm1 = l * l + l + (m - 1)
+                if acn_mm1 >= 0 and acn_mm1 < n_sh:
+                    R[acn_m, acn_mm1] = s * math.sqrt((l + m) * (l - m + 1)) / 2
+                    R[acn_mm1, acn_m] = -s * math.sqrt((l + m) * (l - m + 1)) / 2
+    
+    return R
+
+
+def convert_to_spherical(cartesian: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """
+    Convert Cartesian coordinates (x, y, z) to spherical coordinates (azimuth, elevation, distance).
+    
+    Uses the convention:
+    - Azimuth: angle in x-z plane (0 = front, π/2 = left, π = back, 3π/2 = right)
+    - Elevation: angle from x-z plane (-π/2 = down, 0 = horizon, π/2 = up)
+    - Distance: distance from origin
+    
+    Args:
+        cartesian: (x, y, z) coordinates
+        
+    Returns:
+        (azimuth, elevation, distance) in radians and same distance unit as input
+    """
+    x, y, z = cartesian
+    
+    # Calculate distance
+    distance = math.sqrt(x*x + y*y + z*z)
+    
+    # Handle the origin
+    if distance < 1e-10:
+        return (0.0, 0.0, 0.0)
+    
+    # Calculate elevation (latitude)
+    elevation = math.asin(y / distance)
+    
+    # Calculate azimuth (longitude)
+    azimuth = math.atan2(x, z)
+    
+    return (azimuth, elevation, distance)
+
+
+def convert_to_cartesian(spherical: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """
+    Convert spherical coordinates (azimuth, elevation, distance) to Cartesian coordinates (x, y, z).
+    
+    Uses the convention:
+    - Azimuth: angle in x-z plane (0 = front, π/2 = left, π = back, 3π/2 = right)
+    - Elevation: angle from x-z plane (-π/2 = down, 0 = horizon, π/2 = up)
+    - Distance: distance from origin
+    
+    Args:
+        spherical: (azimuth, elevation, distance) in radians and distance unit
+        
+    Returns:
+        (x, y, z) in the same distance unit as input
+    """
+    azimuth, elevation, distance = spherical
+    
+    # Calculate Cartesian coordinates
+    x = distance * math.sin(azimuth) * math.cos(elevation)
+    y = distance * math.sin(elevation)
+    z = distance * math.cos(azimuth) * math.cos(elevation)
+    
+    return (x, y, z)
+
+
+# =====================================================================================
+# Core Ambisonics Processing Functions
+# =====================================================================================
+
+def encode_mono_source(audio: np.ndarray, position: Tuple[float, float, float], 
+                      order: int, normalization: AmbisonicNormalization = AmbisonicNormalization.SN3D) -> np.ndarray:
+    """
+    Encode a mono audio source into ambisonic signals.
+    
+    Args:
+        audio: Mono audio signal, shape (n_samples,)
+        position: (azimuth, elevation, distance) in radians and meters
+        order: Ambisonic order
+        normalization: Normalization convention
+        
+    Returns:
+        Ambisonic signals, shape ((order+1)², n_samples)
+    """
+    azimuth, elevation, distance = position
+    n_sh = (order + 1) ** 2
+    n_samples = len(audio)
+    
+    # Initialize ambisonic signals
+    ambi_signals = np.zeros((n_sh, n_samples))
+    
+    # Apply distance attenuation (simplified inverse distance law)
+    if distance < 1.0:
+        distance = 1.0  # Prevent division by zero or amplification
+    
+    distance_gain = 1.0 / distance
+    attenuated_audio = audio * distance_gain
+    
+    # Encode to each ambisonic channel
+    for l in range(order + 1):
+        for m in range(-l, l + 1):
+            # Calculate ACN index
+            acn = l * l + l + m
+            
+            # Calculate the spherical harmonic coefficient
+            sh_val = real_spherical_harmonic(l, m, azimuth, elevation, normalization)
+            
+            # Apply encoding
+            ambi_signals[acn] = attenuated_audio * sh_val
+    
+    return ambi_signals
+
+
+def rotate_ambisonics(ambi_signals: np.ndarray, yaw: float, pitch: float, roll: float) -> np.ndarray:
+    """
+    Rotate an ambisonic sound field.
+    
+    Args:
+        ambi_signals: Ambisonic signals, shape (n_channels, n_samples)
+        yaw: Rotation around vertical axis (positive = left) in radians
+        pitch: Rotation around side axis (positive = up) in radians
+        roll: Rotation around front axis (positive = tilt right) in radians
+        
+    Returns:
+        Rotated ambisonic signals, shape (n_channels, n_samples)
+    """
+    n_channels = ambi_signals.shape[0]
+    order = math.floor(math.sqrt(n_channels)) - 1
+    
+    if (order + 1) ** 2 != n_channels:
+        raise ValueError(f"Number of channels {n_channels} does not correspond to a complete ambisonic order")
+    
+    # Compute the rotation matrix
+    R = compute_rotation_matrix(order, yaw, pitch, roll)
+    
+    # Apply the rotation (matrix multiplication)
+    rotated_signals = np.zeros_like(ambi_signals)
+    for i in range(n_channels):
+        for j in range(n_channels):
+            rotated_signals[i] += R[i, j] * ambi_signals[j]
+    
+    return rotated_signals
+
+
+def apply_distance_model(ambi_signals: np.ndarray, distance: float) -> np.ndarray:
+    """
+    Apply a distance-based attenuation model to ambisonic signals.
+    
+    Args:
+        ambi_signals: Ambisonic signals, shape (n_channels, n_samples)
+        distance: Distance in meters
+        
+    Returns:
+        Attenuated ambisonic signals
+    """
+    # Ensure minimum distance
+    distance = max(0.1, distance)
+    
+    # Apply 1/r distance law
+    gain = 1.0 / distance
+    
+    # Optional: Apply frequency-dependent air absorption for larger distances
+    if distance > 10.0:
+        # This would be a simplified placeholder
+        # In a real implementation, this would apply frequency-dependent filtering
+        gain *= 0.9  # Additional attenuation for distant sources
+    
+    # Apply gain
+    return ambi_signals * gain
+
+
+def apply_source_directivity(ambi_signals: np.ndarray, directivity: float, axis: Tuple[float, float, float]) -> np.ndarray:
+    """
+    Apply directivity pattern to an ambisonic source.
+    
+    Args:
+        ambi_signals: Ambisonic signals, shape (n_channels, n_samples)
+        directivity: Directivity factor (0 = omnidirectional, 1 = cardioid)
+        axis: Direction of maximum radiation (azimuth, elevation, ignored)
+        
+    Returns:
+        Ambisonic signals with directivity applied
+    """
+    if directivity <= 0:
+        return ambi_signals  # No directivity
+    
+    n_channels = ambi_signals.shape[0]
+    order = math.floor(math.sqrt(n_channels)) - 1
+    
+    # Convert axis to unit vector
+    azimuth, elevation, _ = axis
+    axis_vec = np.array([
+        math.sin(azimuth) * math.cos(elevation),
+        math.sin(elevation),
+        math.cos(azimuth) * math.cos(elevation)
+    ])
+    
+    # Apply directivity pattern (simplified)
+    # A full implementation would use spherical harmonic addition theorem
+    result = ambi_signals.copy()
+    
+    # Scale first-order components (Y, Z, X) to create directivity
+    if order >= 1:
+        # W + directivity * (Y*axis.y + Z*axis.z + X*axis.x)
+        result[1] *= (1.0 + directivity * axis_vec[1])  # Y (front-back)
+        result[2] *= (1.0 + directivity * axis_vec[2])  # Z (up-down)
+        result[3] *= (1.0 + directivity * axis_vec[0])  # X (left-right)
+    
+    return result
+
+
+def simple_binauralization(ambi_signals: np.ndarray) -> np.ndarray:
+    """
+    Convert ambisonic signals to binaural stereo using a simplified HRTF model.
+    
+    This is a basic implementation for demonstration. A real implementation would
+    use measured HRTFs and proper convolution.
+    
+    Args:
+        ambi_signals: Ambisonic signals, shape (n_channels, n_samples)
+        
+    Returns:
+        Binaural stereo signals, shape (2, n_samples)
+    """
+    n_channels = ambi_signals.shape[0]
+    n_samples = ambi_signals.shape[1]
+    order = math.floor(math.sqrt(n_channels)) - 1
+    
+    # Initialize binaural output
+    binaural = np.zeros((2, n_samples))
+    
+    # Simple decoding coefficients (placeholder for real HRTFs)
+    # Left ear coefficients: W + Y - X
+    # Right ear coefficients: W + Y + X
+    
+    # Apply W channel (omnidirectional component)
+    binaural[0] += 0.7071 * ambi_signals[0]  # Left
+    binaural[1] += 0.7071 * ambi_signals[0]  # Right
+    
+    if order >= 1:
+        # Apply Y channel (front-back)
+        binaural[0] += 0.5 * ambi_signals[1]  # Left
+        binaural[1] += 0.5 * ambi_signals[1]  # Right
+        
+        # Apply Z channel (up-down)
+        binaural[0] += 0.0 * ambi_signals[2]  # Left (neutral)
+        binaural[1] += 0.0 * ambi_signals[2]  # Right (neutral)
+        
+        # Apply X channel (left-right)
+        binaural[0] += -0.5 * ambi_signals[3]  # Left (negative)
+        binaural[1] += 0.5 * ambi_signals[3]   # Right (positive)
+    
+    # Higher order components would require more sophisticated processing
+    
+    return binaural
+
+
+def mix_ambisonic_streams(streams: List[np.ndarray]) -> np.ndarray:
+    """
+    Mix multiple ambisonic streams together.
+    
+    Args:
+        streams: List of ambisonic signals, each shape (n_channels, n_samples)
+        
+    Returns:
+        Mixed ambisonic signals
+    """
+    if not streams:
+        return np.array([])
+    
+    # Find the maximum length and number of channels
+    max_channels = max(stream.shape[0] for stream in streams)
+    max_samples = max(stream.shape[1] for stream in streams)
+    
+    # Initialize output
+    mixed = np.zeros((max_channels, max_samples))
+    
+    # Mix streams
+    for stream in streams:
+        n_channels, n_samples = stream.shape
+        mixed[:n_channels, :n_samples] += stream
+    
+    # Normalize if needed to prevent clipping
+    max_val = np.max(np.abs(mixed))
+    if max_val > 0.99:
+        mixed = mixed * 0.99 / max_val
+    
+    return mixed
+
+
+# =====================================================================================
+# SHAC Codec Class Implementation
+# =====================================================================================
+
+class SHACCodec:
+    """
+    Main class for the Spherical Harmonic Audio Codec (SHAC).
+    
+    This class provides a high-level interface for encoding, processing,
+    and decoding spatial audio using spherical harmonics.
+    """
+    
+    def __init__(self, order: int = 3, sample_rate: int = 48000, 
+                normalization: AmbisonicNormalization = AmbisonicNormalization.SN3D,
+                ordering: AmbisonicOrdering = AmbisonicOrdering.ACN):
+        """
+        Initialize the SHAC codec.
+        
+        Args:
+            order: Ambisonic order
+            sample_rate: Sample rate in Hz
+            normalization: Normalization convention
+            ordering: Channel ordering convention
+        """
+        self.order = order
+        self.sample_rate = sample_rate
+        self.normalization = normalization
+        self.ordering = ordering
+        self.n_channels = (order + 1) ** 2
+        
+        # Initialize processing state
+        self.sources = {}  # Dictionary to store source audio and metadata
+        self.listener_position = (0.0, 0.0, 0.0)  # (x, y, z) in meters
+        self.listener_rotation = (0.0, 0.0, 0.0)  # (yaw, pitch, roll) in radians
+    
+    def add_mono_source(self, source_id: str, audio: np.ndarray, position: Tuple[float, float, float],
+                       directivity: float = 0.0, directivity_axis: Tuple[float, float, float] = None) -> None:
+        """
+        Add a mono audio source to the codec.
+        
+        Args:
+            source_id: Unique identifier for the source
+            audio: Mono audio signal
+            position: (azimuth, elevation, distance) in radians and meters
+            directivity: Directivity factor (0.0 = omnidirectional, 1.0 = cardioid)
+            directivity_axis: Direction of maximum radiation (defaults to source direction)
+        """
+        # Ensure audio is mono
+        if len(audio.shape) > 1 and audio.shape[1] > 1:
+            audio = np.mean(audio, axis=1)
+        
+        # Normalize audio to prevent clipping
+        max_val = np.max(np.abs(audio))
+        if max_val > 0.99:
+            audio = audio * 0.99 / max_val
+        
+        # Set default directivity axis if not provided
+        if directivity_axis is None:
+            directivity_axis = position
+        
+        # Store source data
+        self.sources[source_id] = {
+            'audio': audio,
+            'position': position,
+            'directivity': directivity,
+            'directivity_axis': directivity_axis,
+            'gain': 1.0,
+            'muted': False
+        }
+    
+    def set_source_position(self, source_id: str, position: Tuple[float, float, float]) -> None:
+        """
+        Update the position of a source.
+        
+        Args:
+            source_id: Identifier of the source to update
+            position: New (azimuth, elevation, distance) in radians and meters
+        """
+        if source_id not in self.sources:
+            raise ValueError(f"Source {source_id} does not exist")
+        
+        # Update position
+        self.sources[source_id]['position'] = position
+    
+    def set_source_gain(self, source_id: str, gain: float) -> None:
+        """
+        Set the gain for a source.
+        
+        Args:
+            source_id: Identifier of the source to update
+            gain: Gain factor (1.0 = unity gain)
+        """
+        if source_id not in self.sources:
+            raise ValueError(f"Source {source_id} does not exist")
+        
+        # Update gain
+        self.sources[source_id]['gain'] = gain
+    
+    def mute_source(self, source_id: str, muted: bool = True) -> None:
+        """
+        Mute or unmute a source.
+        
+        Args:
+            source_id: Identifier of the source to update
+            muted: True to mute, False to unmute
+        """
+        if source_id not in self.sources:
+            raise ValueError(f"Source {source_id} does not exist")
+        
+        # Update mute state
+        self.sources[source_id]['muted'] = muted
+    
+    def set_listener_position(self, position: Tuple[float, float, float]) -> None:
+        """
+        Set the listener position.
+        
+        Args:
+            position: (x, y, z) in meters
+        """
+        self.listener_position = position
+    
+    def set_listener_rotation(self, rotation: Tuple[float, float, float]) -> None:
+        """
+        Set the listener rotation.
+        
+        Args:
+            rotation: (yaw, pitch, roll) in radians
+        """
+        self.listener_rotation = rotation
+    
+    def process(self) -> np.ndarray:
+        """
+        Process all sources to create the final ambisonic signals.
+        
+        Returns:
+            Processed ambisonic signals, shape (n_channels, n_samples)
+        """
+        # Find the maximum number of samples across all sources
+        max_samples = 0
+        for source_id, source_data in self.sources.items():
+            if not source_data['muted']:
+                max_samples = max(max_samples, len(source_data['audio']))
+        
+        if max_samples == 0:
+            return np.zeros((self.n_channels, 0))
+        
+        # Initialize output signals
+        output_signals = np.zeros((self.n_channels, max_samples))
+        
+        # Process each source
+        for source_id, source_data in self.sources.items():
+            # Skip muted sources
+            if source_data['muted']:
+                continue
+            
+            # Get source parameters
+            audio = source_data['audio']
+            position = source_data['position']
+            directivity = source_data['directivity']
+            directivity_axis = source_data['directivity_axis']
+            gain = source_data['gain']
+            
+            # Encode to ambisonics
+            ambi_source = encode_mono_source(audio, position, self.order, self.normalization)
+            
+            # Apply directivity if needed
+            if directivity > 0:
+                ambi_source = apply_source_directivity(ambi_source, directivity, directivity_axis)
+            
+            # Apply gain
+            ambi_source *= gain
+            
+            # Mix into output
+            n_samples = min(ambi_source.shape[1], output_signals.shape[1])
+            output_signals[:, :n_samples] += ambi_source[:, :n_samples]
+        
+        # Apply listener rotation
+        yaw, pitch, roll = self.listener_rotation
+        if yaw != 0 or pitch != 0 or roll != 0:
+            output_signals = rotate_ambisonics(output_signals, yaw, pitch, roll)
+        
+        # Normalize if necessary
+        max_val = np.max(np.abs(output_signals))
+        if max_val > 0.99:
+            output_signals = output_signals * 0.99 / max_val
+        
+        return output_signals
+    
+    def binauralize(self, ambi_signals: np.ndarray) -> np.ndarray:
+        """
+        Convert ambisonic signals to binaural stereo.
+        
+        Args:
+            ambi_signals: Ambisonic signals to binauralize
+            
+        Returns:
+            Binaural stereo signals, shape (2, n_samples)
+        """
+        return simple_binauralization(ambi_signals)
+
+
+class SHACStreamProcessor:
+    """
+    Real-time stream processor for SHAC audio.
+    
+    This class handles real-time processing of spatial audio streams.
+    """
+    
+    def __init__(self, order: int = 3, sample_rate: int = 48000, buffer_size: int = 1024):
+        """
+        Initialize the stream processor.
+        
+        Args:
+            order: Ambisonic order
+            sample_rate: Sample rate in Hz
+            buffer_size: Processing buffer size in samples
+        """
+        self.order = order
+        self.sample_rate = sample_rate
+        self.buffer_size = buffer_size
+        self.n_channels = (order + 1) ** 2
+        
+        # Create core codec
+        self.codec = SHACCodec(order, sample_rate)
+        
+        # Initialize streaming state
+        self.sources = {}
+        self.source_buffers = {}
+        self.output_buffer = np.zeros((self.n_channels, buffer_size))
+        
+        # Processing parameters
+        self.listener_rotation = (0.0, 0.0, 0.0)
+    
+    def add_source(self, source_id: str, position: Tuple[float, float, float],
+                  directivity: float = 0.0, directivity_axis: Tuple[float, float, float] = None) -> None:
+        """
+        Add a streaming source.
+        
+        Args:
+            source_id: Unique identifier for the source
+            position: (azimuth, elevation, distance) in radians and meters
+            directivity: Directivity factor (0.0 = omnidirectional, 1.0 = cardioid)
+            directivity_axis: Direction of maximum radiation (defaults to source direction)
+        """
+        # Set default directivity axis if not provided
+        if directivity_axis is None:
+            directivity_axis = position
+        
+        # Store source information
+        self.sources[source_id] = {
+            'position': position,
+            'directivity': directivity,
+            'directivity_axis': directivity_axis,
+            'gain': 1.0,
+            'muted': False
+        }
+        
+        # Initialize source buffer
+        self.source_buffers[source_id] = np.zeros(self.buffer_size)
+    
+    def remove_source(self, source_id: str) -> None:
+        """
+        Remove a streaming source.
+        
+        Args:
+            source_id: Identifier of the source to remove
+        """
+        if source_id in self.sources:
+            del self.sources[source_id]
+        
+        if source_id in self.source_buffers:
+            del self.source_buffers[source_id]
+    
+    def update_source(self, source_id: str, audio_chunk: np.ndarray) -> None:
+        """
+        Update a source with new audio data.
+        
+        Args:
+            source_id: Identifier of the source to update
+            audio_chunk: New audio data chunk
+        """
+        if source_id not in self.sources:
+            return
+        
+        # Ensure audio is mono
+        if len(audio_chunk.shape) > 1 and audio_chunk.shape[1] > 1:
+            audio_chunk = np.mean(audio_chunk, axis=1)
+        
+        # Copy audio data to source buffer
+        n_samples = min(len(audio_chunk), self.buffer_size)
+        self.source_buffers[source_id][:n_samples] = audio_chunk[:n_samples]
+        
+        # If audio chunk is smaller than buffer, zero-pad
+        if n_samples < self.buffer_size:
+            self.source_buffers[source_id][n_samples:] = 0.0
+    
+    def update_source_position(self, source_id: str, position: Tuple[float, float, float]) -> None:
+        """
+        Update the position of a source.
+        
+        Args:
+            source_id: Identifier of the source to update
+            position: New (azimuth, elevation, distance) in radians and meters
+        """
+        if source_id not in self.sources:
+            return
+        
+        self.sources[source_id]['position'] = position
+    
+    def set_source_gain(self, source_id: str, gain: float) -> None:
+        """
+        Set the gain for a source.
+        
+        Args:
+            source_id: Identifier of the source to update
+            gain: Gain factor (1.0 = unity gain)
+        """
+        if source_id not in self.sources:
+            return
+        
+        self.sources[source_id]['gain'] = gain
+    
+    def mute_source(self, source_id: str, muted: bool = True) -> None:
+        """
+        Mute or unmute a source.
+        
+        Args:
+            source_id: Identifier of the source to update
+            muted: True to mute, False to unmute
+        """
+        if source_id not in self.sources:
+            return
+        
+        self.sources[source_id]['muted'] = muted
+    
+    def set_listener_rotation(self, yaw: float, pitch: float, roll: float) -> None:
+        """
+        Set the listener's head rotation.
+        
+        Args:
+            yaw: Rotation around vertical axis in radians
+            pitch: Rotation around side axis in radians
+            roll: Rotation around front axis in radians
+        """
+        self.listener_rotation = (yaw, pitch, roll)
+    
+    def process_block(self) -> np.ndarray:
+        """
+        Process a block of audio.
+        
+        Returns:
+            Processed ambisonic signals, shape (n_channels, buffer_size)
+        """
+        # Initialize output buffer
+        output_buffer = np.zeros((self.n_channels, self.buffer_size))
+        
+        # Process each source
+        for source_id, source_info in self.sources.items():
+            # Skip muted sources
+            if source_info['muted']:
+                continue
+            
+            # Get source parameters
+            position = source_info['position']
+            directivity = source_info['directivity']
+            directivity_axis = source_info['directivity_axis']
+            gain = source_info['gain']
+            
+            # Get audio data
+            audio = self.source_buffers[source_id]
+            
+            # Encode to ambisonics
+            ambi_source = encode_mono_source(audio, position, self.order, AmbisonicNormalization.SN3D)
+            
+            # Apply source directivity if needed
+            if directivity > 0:
+                ambi_source = apply_source_directivity(ambi_source, directivity, directivity_axis)
+            
+            # Apply gain
+            ambi_source *= gain
+            
+            # Mix into output buffer
+            output_buffer += ambi_source
+        
+        # Apply rotation if needed
+        yaw, pitch, roll = self.listener_rotation
+        if yaw != 0 or pitch != 0 or roll != 0:
+            output_buffer = rotate_ambisonics(output_buffer, yaw, pitch, roll)
+        
+        # Normalize if necessary
+        max_val = np.max(np.abs(output_buffer))
+        if max_val > 0.99:
+            output_buffer = output_buffer * 0.99 / max_val
+        
+        return output_buffer
+    
+    def get_binaural_output(self) -> np.ndarray:
+        """
+        Get the current block as binaural stereo.
+        
+        Returns:
+            Binaural stereo signals, shape (2, buffer_size)
+        """
+        # Process the current block
+        ambi_block = self.process_block()
+        
+        # Convert to binaural
+        return simple_binauralization(ambi_block)
+
+
+# =====================================================================================
+# SHAC File Format Implementation
+# =====================================================================================
+
+import struct
+from typing import BinaryIO
+
+class SHACFileWriter:
+    """
+    Writer for the Spherical Harmonic Audio Codec (SHAC) file format.
+    """
+    
+    def __init__(self, order: int, sample_rate: int, normalization: AmbisonicNormalization = AmbisonicNormalization.SN3D):
+        """
+        Initialize the SHAC file writer.
+        
+        Args:
+            order: Ambisonic order
+            sample_rate: Sample rate in Hz
+            normalization: Normalization convention
+        """
+        self.order = order
+        self.sample_rate = sample_rate
+        self.normalization = normalization
+        self.n_channels = (order + 1) ** 2
+        self.layers = {}
+        self.layer_metadata = {}
+    
+    def add_layer(self, layer_id: str, ambi_signals: np.ndarray, metadata: Dict = None):
+        """
+        Add a layer to the SHAC file.
+        
+        Args:
+            layer_id: Unique identifier for the layer
+            ambi_signals: Ambisonic signals for this layer
+            metadata: Optional metadata for the layer
+        """
+        if ambi_signals.shape[0] != self.n_channels:
+            raise ValueError(f"Expected {self.n_channels} channels, got {ambi_signals.shape[0]}")
+        
+        self.layers[layer_id] = ambi_signals
+        
+        if metadata is None:
+            metadata = {}
+        
+        self.layer_metadata[layer_id] = metadata
+    
+    def write_file(self, filename: str, bit_depth: int = 32) -> None:
+        """
+        Write the SHAC file to disk.
+        
+        Args:
+            filename: Output filename
+            bit_depth: Bit depth (16 or 32)
+        """
+        # Validate bit depth
+        if bit_depth not in [16, 32]:
+            raise ValueError("Bit depth must be 16 or 32")
+        
+        # Determine the sample format code
+        sample_format = 1 if bit_depth == 16 else 2
+        
+        # Find the maximum number of frames across all layers
+        max_frames = max(layer.shape[1] for layer in self.layers.values()) if self.layers else 0
+        
+        with open(filename, 'wb') as f:
+            # Write header
+            self._write_header(f, max_frames, sample_format)
+            
+            # Write channel metadata section
+            self._write_channel_metadata(f)
+            
+            # Write layer information section
+            self._write_layer_metadata(f)
+            
+            # Write spatial metadata section
+            self._write_spatial_metadata(f)
+            
+            # Write audio data section
+            self._write_audio_data(f, max_frames, bit_depth, sample_format)
+    
+    def _write_header(self, f: BinaryIO, n_frames: int, sample_format: int) -> None:
+        """Write the file header"""
+        f.write(b'SHAC')  # Magic number
+        f.write(struct.pack('<I', 1))  # Version
+        f.write(struct.pack('<I', self.order))  # Ambisonics order
+        f.write(struct.pack('<I', self.sample_rate))  # Sample rate
+        f.write(struct.pack('<I', self.n_channels))  # Number of channels
+        f.write(struct.pack('<I', sample_format))  # Sample format
+        f.write(struct.pack('<I', n_frames))  # Number of frames
+        f.write(struct.pack('<I', 0))  # Reserved
+    
+    def _write_channel_metadata(self, f: BinaryIO) -> None:
+        """Write the channel metadata section"""
+        # Calculate section size
+        section_size = 4 + 16 * self.n_channels  # Size field + (4 fields * 4 bytes * n_channels)
+        f.write(struct.pack('<I', section_size))  # Section size
+        
+        # Write metadata for each channel
+        for acn in range(self.n_channels):
+            # Calculate degree (l) and order (m) from ACN index
+            l = int(np.sqrt(acn))
+            m = acn - l*l - l
+            
+            f.write(struct.pack('<I', acn))  # Channel index
+            f.write(struct.pack('<I', l))  # Spherical harmonic degree
+            f.write(struct.pack('<I', m))  # Spherical harmonic order
+            f.write(struct.pack('<I', self.normalization.value))  # Normalization type
+    
+    def _write_layer_metadata(self, f: BinaryIO) -> None:
+        """Write the layer information section"""
+        # Calculate section size
+        section_size = 8  # Base size (section size + number of layers)
+        for layer_id, metadata in self.layer_metadata.items():
+            layer_id_bytes = layer_id.encode('utf-8')
+            section_size += 8  # Layer ID + name length
+            section_size += len(layer_id_bytes)  # Layer name
+            mask_bytes = (self.n_channels + 7) // 8
+            section_size += 4 + mask_bytes  # Mask size + mask
+        
+        f.write(struct.pack('<I', section_size))  # Section size
+        f.write(struct.pack('<I', len(self.layers)))  # Number of layers
+        
+        # Write each layer's metadata
+        for layer_id, metadata in self.layer_metadata.items():
+            layer_id_bytes = layer_id.encode('utf-8')
+            
+            # Use hash of layer_id as numeric identifier
+            layer_id_hash = hash(layer_id) & 0xFFFFFFFF
+            f.write(struct.pack('<I', layer_id_hash))  # Layer ID
+            
+            f.write(struct.pack('<I', len(layer_id_bytes)))  # Layer name length
+            f.write(layer_id_bytes)  # Layer name
+            
+            # Write channel mask (which channels belong to this layer)
+            mask_bytes = (self.n_channels + 7) // 8
+            mask = bytearray(mask_bytes)
+            for i in range(self.n_channels):
+                mask[i // 8] |= (1 << (i % 8))
+            
+            f.write(struct.pack('<I', mask_bytes))  # Mask size
+            f.write(mask)  # Channel mask
+    
+    def _write_spatial_metadata(self, f: BinaryIO) -> None:
+        """Write the spatial metadata section"""
+        # For simplicity, we'll just write a minimal section with defaults
+        # A full implementation would include source positions, directivity, etc.
+        
+        # Calculate section size
+        section_size = 8  # Base size (section size + number of entries)
+        for layer_id, metadata in self.layer_metadata.items():
+            if 'position' in metadata:
+                section_size += 48  # Fixed size per spatial entry
+        
+        f.write(struct.pack('<I', section_size))  # Section size
+        
+        # Count spatial entries
+        spatial_entries = sum(1 for metadata in self.layer_metadata.values() if 'position' in metadata)
+        f.write(struct.pack('<I', spatial_entries))  # Number of spatial entries
+        
+        # Write each spatial entry
+        for layer_id, metadata in self.layer_metadata.items():
+            if 'position' in metadata:
+                layer_id_hash = hash(layer_id) & 0xFFFFFFFF
+                f.write(struct.pack('<I', layer_id_hash))  # Layer ID
+                
+                # Entry type (1 = source)
+                entry_type = 1
+                f.write(struct.pack('<I', entry_type))
+                
+                # Position (azimuth, elevation, distance)
+                position = metadata.get('position', (0.0, 0.0, 1.0))
+                f.write(struct.pack('<fff', *position))
+                
+                # Directivity factor
+                directivity = metadata.get('directivity', 0.0)
+                f.write(struct.pack('<f', directivity))
+                
+                # Directivity axis
+                axis = metadata.get('directivity_axis', position)
+                f.write(struct.pack('<fff', *axis))
+                
+                # Source width
+                width = metadata.get('width', 0.0)
+                f.write(struct.pack('<f', width))
+    
+    def _write_audio_data(self, f: BinaryIO, n_frames: int, bit_depth: int, sample_format: int) -> None:
+        """Write the audio data section"""
+        # Mix all layers together
+        mixed_audio = np.zeros((self.n_channels, n_frames))
+        for layer_id, ambi_signals in self.layers.items():
+            n_frames_layer = ambi_signals.shape[1]
+            mixed_audio[:, :n_frames_layer] += ambi_signals
+        
+        # Normalize to prevent clipping
+        max_val = np.max(np.abs(mixed_audio))
+        if max_val > 0.99:
+            mixed_audio = mixed_audio * 0.99 / max_val
+        
+        # Convert to the appropriate format
+        if bit_depth == 16:
+            mixed_audio = (mixed_audio * 32767).astype(np.int16)
+        else:
+            mixed_audio = mixed_audio.astype(np.float32)
+        
+        # Write interleaved audio data
+        for frame in range(n_frames):
+            for ch in range(self.n_channels):
+                if bit_depth == 16:
+                    f.write(struct.pack('<h', mixed_audio[ch, frame]))
+                else:
+                    f.write(struct.pack('<f', mixed_audio[ch, frame]))
+
+
+class SHACFileReader:
+    """
+    Reader for the Spherical Harmonic Audio Codec (SHAC) file format.
+    """
+    
+    def __init__(self, filename: str):
+        """
+        Initialize the SHAC file reader.
+        
+        Args:
+            filename: Input filename
+        """
+        self.filename = filename
+        self.file_info = {}
+        self.channel_metadata = []
+        self.layers = {}
+        self.layer_metadata = {}
+        self.spatial_metadata = {}
+        
+        # Read file header and metadata
+        self._read_header()
+    
+    def _read_header(self) -> None:
+        """Read and parse the file header and metadata sections"""
+        with open(self.filename, 'rb') as f:
+            # Read header
+            magic = f.read(4)
+            if magic != b'SHAC':
+                raise ValueError("Not a valid SHAC file")
+            
+            # Parse header fields
+            version = struct.unpack('<I', f.read(4))[0]
+            order = struct.unpack('<I', f.read(4))[0]
+            sample_rate = struct.unpack('<I', f.read(4))[0]
+            n_channels = struct.unpack('<I', f.read(4))[0]
+            sample_format = struct.unpack('<I', f.read(4))[0]
+            n_frames = struct.unpack('<I', f.read(4))[0]
+            reserved = struct.unpack('<I', f.read(4))[0]
+            
+            self.file_info = {
+                'version': version,
+                'order': order,
+                'sample_rate': sample_rate,
+                'n_channels': n_channels,
+                'sample_format': sample_format,
+                'n_frames': n_frames
+            }
+            
+            # Read channel metadata section
+            self._read_channel_metadata(f)
+            
+            # Read layer metadata section
+            self._read_layer_metadata(f)
+            
+            # Read spatial metadata section if present
+            try:
+                self._read_spatial_metadata(f)
+            except Exception:
+                # If we can't read spatial metadata, just continue
+                pass
+            
+            # Store the offset to the audio data
+            self.audio_data_offset = f.tell()
+    
+    def _read_channel_metadata(self, f: BinaryIO) -> None:
+        """Read the channel metadata section"""
+        section_size = struct.unpack('<I', f.read(4))[0]
+        
+        # Read metadata for each channel
+        n_channels = self.file_info['n_channels']
+        for _ in range(n_channels):
+            channel_idx = struct.unpack('<I', f.read(4))[0]
+            degree = struct.unpack('<I', f.read(4))[0]
+            order = struct.unpack('<I', f.read(4))[0]
+            norm_type = struct.unpack('<I', f.read(4))[0]
+            
+            self.channel_metadata.append({
+                'channel_idx': channel_idx,
+                'degree': degree,
+                'order': order,
+                'normalization': AmbisonicNormalization(norm_type)
+            })
+    
+    def _read_layer_metadata(self, f: BinaryIO) -> None:
+        """Read the layer metadata section"""
+        section_size = struct.unpack('<I', f.read(4))[0]
+        n_layers = struct.unpack('<I', f.read(4))[0]
+        
+        # Read metadata for each layer
+        for _ in range(n_layers):
+            layer_id = struct.unpack('<I', f.read(4))[0]
+            name_length = struct.unpack('<I', f.read(4))[0]
+            layer_name = f.read(name_length).decode('utf-8')
+            
+            mask_size = struct.unpack('<I', f.read(4))[0]
+            channel_mask = f.read(mask_size)
+            
+            # Parse channel mask
+            channels = []
+            for byte_idx, byte_val in enumerate(channel_mask):
+                for bit_idx in range(8):
+                    if byte_val & (1 << bit_idx):
+                        channel_idx = byte_idx * 8 + bit_idx
+                        if channel_idx < self.file_info['n_channels']:
+                            channels.append(channel_idx)
+            
+            # Store layer metadata
+            self.layer_metadata[layer_name] = {
+                'layer_id': layer_id,
+                'channels': channels
+            }
+    
+    def _read_spatial_metadata(self, f: BinaryIO) -> None:
+        """Read the spatial metadata section"""
+        section_size = struct.unpack('<I', f.read(4))[0]
+        n_entries = struct.unpack('<I', f.read(4))[0]
+        
+        # Read each spatial entry
+        for _ in range(n_entries):
+            layer_id = struct.unpack('<I', f.read(4))[0]
+            entry_type = struct.unpack('<I', f.read(4))[0]
+            
+            # Position (azimuth, elevation, distance)
+            azimuth, elevation, distance = struct.unpack('<fff', f.read(12))
+            
+            # Directivity factor
+            directivity = struct.unpack('<f', f.read(4))[0]
+            
+            # Directivity axis
+            axis_az, axis_el, axis_dist = struct.unpack('<fff', f.read(12))
+            
+            # Source width
+            width = struct.unpack('<f', f.read(4))[0]
+            
+            # Find the layer name corresponding to this ID
+            layer_name = None
+            for name, metadata in self.layer_metadata.items():
+                if metadata['layer_id'] == layer_id:
+                    layer_name = name
+                    break
+            
+            if layer_name:
+                self.spatial_metadata[layer_name] = {
+                    'type': entry_type,
+                    'position': (azimuth, elevation, distance),
+                    'directivity': directivity,
+                    'directivity_axis': (axis_az, axis_el, axis_dist),
+                    'width': width
+                }
+    
+    def read_audio_data(self) -> np.ndarray:
+        """
+        Read the complete audio data from the file.
+        
+        Returns:
+            Ambisonic signals, shape (n_channels, n_frames)
+        """
+        n_channels = self.file_info['n_channels']
+        n_frames = self.file_info['n_frames']
+        sample_format = self.file_info['sample_format']
+        
+        # Determine data type and scaling
+        if sample_format == 1:  # 16-bit PCM
+            dtype = np.int16
+            scale = 1.0 / 32768.0
+        elif sample_format == 2:  # 32-bit float
+            dtype = np.float32
+            scale = 1.0
+        else:
+            raise ValueError(f"Unsupported sample format: {sample_format}")
+        
+        # Read the audio data
+        audio_data = np.zeros((n_channels, n_frames), dtype=np.float32)
+        
+        with open(self.filename, 'rb') as f:
+            # Seek to audio data
+            f.seek(self.audio_data_offset)
+            
+            # Read interleaved data
+            for frame in range(n_frames):
+                for ch in range(n_channels):
+                    if sample_format == 1:  # 16-bit PCM
+                        value = struct.unpack('<h', f.read(2))[0] * scale
+                    else:  # 32-bit float
+                        value = struct.unpack('<f', f.read(4))[0]
+                    
+                    audio_data[ch, frame] = value
+        
+        return audio_data
+    
+    def get_layer_names(self) -> List[str]:
+        """
+        Get the names of all layers in the file.
+        
+        Returns:
+            List of layer names
+        """
+        return list(self.layer_metadata.keys())
+    
+    def get_file_info(self) -> Dict:
+        """
+        Get information about the SHAC file.
+        
+        Returns:
+            Dictionary with file information
+        """
+        return self.file_info
+
+
+# =====================================================================================
+# Example Usage
+# =====================================================================================
+
+def create_example_sound_scene(output_file: str = "example_scene.shac"):
+    """
+    Create and save an example 3D sound scene.
+    
+    Args:
+        output_file: Path to save the SHAC file
+    
+    Returns:
+        SHACCodec instance with the example scene
+    """
+    # Create a SHAC codec
+    codec = SHACCodec(order=3, sample_rate=48000)
+    
+    # Create synthetic audio signals
+    duration = 5.0  # seconds
+    sample_rate = 48000
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    
+    # Piano sound (sine wave with harmonics and decay)
+    piano_freq = 440.0  # A4
+    piano_audio = 0.5 * np.sin(2 * np.pi * piano_freq * t) * np.exp(-t/2)
+    piano_audio += 0.25 * np.sin(2 * np.pi * 2 * piano_freq * t) * np.exp(-t/1.5)
+    piano_audio += 0.125 * np.sin(2 * np.pi * 3 * piano_freq * t) * np.exp(-t)
+    
+    # Drum sound (impulses with decay)
+    drum_audio = np.zeros_like(t)
+    for i in range(0, len(t), int(sample_rate / 4)):  # Four beats per second
+        if i + 5000 < len(drum_audio):
+            drum_audio[i:i+5000] = 0.8 * np.exp(-np.linspace(0, 10, 5000))
+    
+    # Ambient sound (filtered noise)
+    np.random.seed(42)  # For reproducibility
+    noise = np.random.randn(len(t))
+    b, a = np.array([0.2, 0.2, 0.2, 0.2, 0.2]), np.array([1.0])  # Simple moving average filter
+    ambient_audio = np.convolve(noise, b/a, mode='same') * 0.2
+    
+    # Add sources to the codec
+    # Position format: (azimuth, elevation, distance) in radians and meters
+    
+    # Piano in front left
+    piano_position = (-np.pi/4, 0.0, 3.0)
+    codec.add_mono_source("piano", piano_audio, piano_position, directivity=0.7)
+    
+    # Drum in front right
+    drum_position = (np.pi/4, -0.1, 2.5)
+    codec.add_mono_source("drum", drum_audio, drum_position, directivity=0.3)
+    
+    # Ambient sound above
+    ambient_position = (0.0, np.pi/3, 5.0)
+    codec.add_mono_source("ambient", ambient_audio, ambient_position)
+    
+    # Process the scene to get ambisonic signals
+    ambi_signals = codec.process()
+    
+    # Create a SHAC file writer
+    writer = SHACFileWriter(codec.order, codec.sample_rate, codec.normalization)
+    
+    # Add each source as a separate layer
+    for source_id, source_data in codec.sources.items():
+        # Encode the source to ambisonics
+        position = source_data['position']
+        audio = source_data['audio']
+        directivity = source_data.get('directivity', 0.0)
+        directivity_axis = source_data.get('directivity_axis', position)
+        
+        # Encode to ambisonics
+        ambi_source = encode_mono_source(audio, position, codec.order, codec.normalization)
+        
+        # Apply directivity if needed
+        if directivity > 0:
+            ambi_source = apply_source_directivity(ambi_source, directivity, directivity_axis)
+        
+        # Add as a layer
+        writer.add_layer(source_id, ambi_source, {
+            'type': 'source',
+            'position': position,
+            'directivity': directivity,
+            'directivity_axis': directivity_axis
+        })
+    
+    # Add the mixed scene as a layer
+    writer.add_layer("mixed", ambi_signals, {'type': 'mixed'})
+    
+    # Write the SHAC file
+    writer.write_file(output_file)
+    
+    return codec
+
+
+if __name__ == "__main__":
+    # Create an example scene
+    codec = create_example_sound_scene()
+    
+    # Process the scene
+    ambi_signals = codec.process()
+    
+    # Apply head rotation (as if user is looking to the left)
+    yaw = np.pi/3  # 60 degrees to the left
+    rotated_ambi = rotate_ambisonics(ambi_signals, yaw, 0.0, 0.0)
+    
+    # Convert to binaural
+    binaural_output = codec.binauralize(rotated_ambi)
+    
+    # Save binaural output
+    try:
+        import soundfile as sf
+        sf.write("binaural_output.wav", binaural_output.T, codec.sample_rate)
+        print("Saved binaural output to binaural_output.wav")
+    except ImportError:
+        print("Could not save audio, soundfile module not available")
+    
+    print("SHAC codec example complete!")
